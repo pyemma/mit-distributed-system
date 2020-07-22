@@ -6,5 +6,3 @@ mrtmp.*
 /pbservice/x.txt
 /kvpaxos/x.txt
 *.so
-/main/*.so
-/main/mrapps/*.so

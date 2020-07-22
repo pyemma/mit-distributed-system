@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -59,6 +60,23 @@ func (m *Master) RegisterWorkerId(args *RegisterWorkerIdArgs, reply *RegisterWor
 	return nil
 }
 
+func (m *Master) CheckStatus(jobType string, jobId int) {
+	time.Sleep(time.Second * 10)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if jobType == Map {
+		jobStatus := m.mapperStatus[jobId]
+		if jobStatus.Status != Done {
+			m.mapperStatus[jobId] = JobStatus{Status: NotScheduled}
+		}
+	} else {
+		jobStatus := m.reducerStatus[jobId]
+		if jobStatus.Status != Done {
+			m.reducerStatus[jobId] = JobStatus{Status: NotScheduled}
+		}
+	}
+}
+
 func (m *Master) GetJob(args *GetJobArgs, reply *GetJobReply) error {
 	// Lock the data and return a file that is not done yet
 	m.mu.Lock()
@@ -90,6 +108,7 @@ func (m *Master) GetJob(args *GetJobArgs, reply *GetJobReply) error {
 				reply.NumReducer = m.numReducer
 				m.mapperStatus[i] = JobStatus{Status: Pending, WorkerId: args.WorkerId}
 				// kick off a goroutines to check if the job is timeout
+				go m.CheckStatus(Map, i)
 				return nil
 			}
 		}
@@ -121,6 +140,7 @@ func (m *Master) GetJob(args *GetJobArgs, reply *GetJobReply) error {
 				reply.NumReducer = m.numReducer
 				m.reducerStatus[i] = JobStatus{Status: Pending, WorkerId: args.WorkerId}
 				// kick off a goroutines to check if the job is timeout
+				go m.CheckStatus(Reduce, i)
 				return nil
 			}
 		}
