@@ -4,3 +4,4 @@ api.key
 .DS_Store
 src/.DS_Store
 src/main/mr-tmp
+*.so
