@@ -29,12 +29,12 @@ type RegisterWorkerIdReply struct {
 }
 
 // client sent a request to fetch a job
-type GetJobArgs struct {
+type RequestJobArgs struct {
 	Msg      string
 	WorkerId int
 }
 
-type GetJobReply struct {
+type RequestJobReply struct {
 	JobType    string   // mapper job or reducer job
 	JobId      int      // mapper job or reducer job id
 	Filenames  []string // the input filename to mapper job or reducer

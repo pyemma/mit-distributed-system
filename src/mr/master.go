@@ -54,8 +54,6 @@ func (m *Master) RegisterWorkerId(args *RegisterWorkerIdArgs, reply *RegisterWor
 	workerId := len(m.workers)
 	m.workers = append(m.workers, workerId)
 
-	// fmt.Println(m.workers)
-
 	reply.WorkerId = workerId
 	return nil
 }
@@ -77,12 +75,12 @@ func (m *Master) CheckStatus(jobType string, jobId int) {
 	}
 }
 
-func (m *Master) GetJob(args *GetJobArgs, reply *GetJobReply) error {
+func (m *Master) RequestJob(args *RequestJobArgs, reply *RequestJobReply) error {
 	// Lock the data and return a file that is not done yet
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	fmt.Println(m.mapperStatus)
-	fmt.Println(m.reducerStatus)
+	defer fmt.Println(m.mapperStatus)
+	defer fmt.Println(m.reducerStatus)
 
 	if m.reducerAllDone {
 		reply.JobType = AllDone

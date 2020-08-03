@@ -52,7 +52,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the master.
 	for {
 		intermediate := []string{}
-		reply := GetJob(workerId)
+		reply := RequestJob(workerId)
 		numReducer := reply.NumReducer
 		switch reply.JobType {
 		case AllDone:
@@ -161,14 +161,14 @@ func RegisterWorkerId() int {
 	return reply.WorkerId
 }
 
-// GetJob makes a RPC call to master to request a job.
-func GetJob(workerId int) GetJobReply {
-	args := GetJobArgs{}
+// RequestJob makes a RPC call to master to request a job.
+func RequestJob(workerId int) RequestJobReply {
+	args := RequestJobArgs{}
 	args.Msg = "This is from a worker " + strconv.Itoa(workerId)
 	args.WorkerId = workerId
 
-	reply := GetJobReply{}
-	call("Master.GetJob", &args, &reply)
+	reply := RequestJobReply{}
+	call("Master.RequestJob", &args, &reply)
 	fmt.Println(reply.JobType)
 	fmt.Println(reply.Filenames)
 	return reply
