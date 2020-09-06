@@ -245,6 +245,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.convertToFollower(args.Term)
 		}
 
+		if args.Term == rf.currentTerm && rf.state == Candidate {
+			rf.convertToFollower(args.Term)
+		}
+
 		rf.resetElectionTimer()
 
 		reply.Term = rf.currentTerm
