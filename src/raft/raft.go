@@ -170,6 +170,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 // Convert to follower
@@ -250,6 +253,29 @@ func (rf *Raft) checkPerv(logIndex int, logTerm int) bool {
 	return true
 }
 
+func (rf *Raft) updateXInfo(logIndex int, logTerm int, reply *AppendEntriesReply) {
+	// case 3, follower too short
+	if len(rf.logEntries) <= logIndex {
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = len(rf.logEntries)
+		return
+	}
+
+	// case 1 and case 2
+	if rf.logEntries[logIndex].Term != logTerm {
+		reply.XTerm = rf.logEntries[logIndex].Term
+		for idx, entry := range rf.logEntries {
+			if entry.Term == reply.XTerm {
+				reply.XIndex = idx
+				break
+			}
+		}
+		reply.XLen = len(rf.logEntries)
+		return
+	}
+}
+
 func (rf *Raft) checkAndCopy(logIndex int, newEntries []LogEntry) {
 	start := logIndex + 1
 	idx := 0
@@ -304,6 +330,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if pervCheck == false {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.updateXInfo(args.PrevLogIndex, args.PrevLogTerm, reply)
+		DPrintf("XTerm %d, XIndex %d, XLen %d", reply.XTerm, reply.XIndex, reply.XLen)
 		return
 	}
 
@@ -447,6 +475,24 @@ func (rf *Raft) startElection() {
 	return
 }
 
+func (rf *Raft) updateNextIdx(reply *AppendEntriesReply) int {
+	idxMap := make(map[int]int)
+	for idx, entry := range rf.logEntries {
+		idxMap[entry.Term] = idx
+	}
+	// case 3
+	if reply.XTerm == -1 {
+		return reply.XLen
+	}
+	val, ok := idxMap[reply.XTerm]
+	// case 1
+	if ok == false {
+		return reply.XIndex
+	}
+	// case 2
+	return val
+}
+
 // replicaLog is the function used by leader to send log to replica
 func (rf *Raft) replicaLog(isHeartbeat bool) {
 	term := rf.currentTerm
@@ -512,7 +558,8 @@ func (rf *Raft) replicaLog(isHeartbeat bool) {
 						rf.nextIndex[server] = lastIdx + 1
 					} else {
 						// need to do an optimization here
-						rf.nextIndex[server] = nextIdx - 1
+						// rf.nextIndex[server] = rf.nextIndex[server] - 1
+						rf.nextIndex[server] = rf.updateNextIdx(reply)
 					}
 				}
 
@@ -524,7 +571,7 @@ func (rf *Raft) replicaLog(isHeartbeat bool) {
 }
 
 func (rf *Raft) updateCommit() {
-	DPrintf("leader %d, current match index %v, current commit index %d", rf.me, rf.matchIndex, rf.commitIndex)
+	// DPrintf("leader %d, current match index %v, current commit index %d", rf.me, rf.matchIndex, rf.commitIndex)
 	newCommit := len(rf.logEntries) - 1
 	for ; newCommit > rf.commitIndex; newCommit -= 1 {
 		commitCount := 1
@@ -533,7 +580,7 @@ func (rf *Raft) updateCommit() {
 				commitCount += 1
 			}
 		}
-		DPrintf("leader %d, current commit index %d, new commit index %d, commit count %d", rf.me, rf.commitIndex, newCommit, commitCount)
+		// DPrintf("leader %d, current commit index %d, new commit index %d, commit count %d", rf.me, rf.commitIndex, newCommit, commitCount)
 		if commitCount >= (len(rf.matchIndex)/2 + 1) {
 			rf.commitIndex = newCommit
 			break
@@ -659,7 +706,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.replicaLog(true)
 			} else {
 				rf.mu.Unlock()
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(40 * time.Millisecond)
 			}
 		}
 	}()
@@ -677,7 +724,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			} else {
 				rf.mu.Unlock()
 			}
-			time.Sleep(15 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 		}
 	}()
 
@@ -693,7 +740,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.updateCommit()
 			}
 			rf.mu.Unlock()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 		}
 	}()
 
@@ -706,7 +753,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				return
 			}
 			if rf.commitIndex > rf.lastApplied {
-				DPrintf("Server %d, update last applied from %d, current commit %d, %v", rf.me, rf.lastApplied, rf.commitIndex, rf.logEntries)
+				// DPrintf("Server %d, update last applied from %d, current commit %d, %v", rf.me, rf.lastApplied, rf.commitIndex, rf.logEntries)
 				rf.lastApplied++
 				idx := rf.lastApplied
 				msg := ApplyMsg{
@@ -717,7 +764,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				applyCh <- msg
 			}
 			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 	}(applyCh)
 
