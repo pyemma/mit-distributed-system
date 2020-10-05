@@ -18,11 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -113,13 +115,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logEntries)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -130,18 +132,22 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logEntries []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logEntries) != nil {
+		DPrintf("Fail to read state")
+	} else {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logEntries = logEntries
+	}
 }
 
 type RequestVoteArgs struct {
@@ -180,6 +186,7 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.currentTerm = term
 	rf.state = Follower
 	rf.votedFor = -1
+	rf.persist()
 }
 
 // Reset election timer
@@ -226,7 +233,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 
 		rf.votedFor = args.CandidateId // candidate is more up to date, vote for it
-		rf.resetElectionTimer()        // whenever we make a vote, we need to reset the election timeout
+		rf.persist()
+		rf.resetElectionTimer() // whenever we make a vote, we need to reset the election timeout
 
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
@@ -288,6 +296,7 @@ func (rf *Raft) checkAndCopy(logIndex int, newEntries []LogEntry) {
 	DPrintf("Server %d tries to append value from idx %d", rf.me, idx)
 	// append all the new entries and overwriting the parts after conflict ones
 	rf.logEntries = append(rf.logEntries[:start+idx], newEntries[idx:]...)
+	rf.persist()
 	DPrintf("Server %d after append value %v", rf.me, rf.logEntries)
 }
 
@@ -391,6 +400,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.state = Candidate
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.resetElectionTimer() // need to reset election timeout since we start a new election
 	// parameters to schedule RequestVote
 	term := rf.currentTerm
@@ -619,6 +629,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.logEntries)
 	term = rf.currentTerm
 	rf.logEntries = append(rf.logEntries, LogEntry{Command: command, Term: term})
+	rf.persist()
 	rf.replicaLog(false)
 
 	return index, term, isLeader
