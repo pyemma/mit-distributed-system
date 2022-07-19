@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
@@ -18,11 +20,24 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key       string
+	Value     string
+	Type      string
+	C         chan Result
+	ClientId  int64
+	RequestId int
+}
+
+type Result struct {
+	Err       Err
+	Value     string
+	CmdIdx    int
+	ClientId  int64
+	RequestId int
 }
 
 type KVServer struct {
@@ -35,15 +50,112 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store       map[string]string   // store of the key/value
+	channels    map[int]chan Result // store of channels
+	lastRequest map[int64]int       // store of last request id
 }
 
+func (kv *KVServer) cleanChannels() {
+	kv.channels = make(map[int]chan Result)
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Key:       args.Key,
+		Type:      "Get",
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+
+	idx, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	ch, ok := kv.channels[idx]
+	if !ok {
+		ch = make(chan Result, 1)
+		kv.channels[idx] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case <-time.After(600 * time.Millisecond):
+		reply.Err = ErrWrongLeader
+		return
+	case res := <-ch:
+		_, isLeader := kv.rf.GetState()
+		if res.ClientId != op.ClientId || res.RequestId != op.RequestId || !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		reply.Err = OK
+		reply.Value = res.Value
+	}
+
+	kv.mu.Lock()
+	delete(kv.channels, idx)
+	kv.mu.Unlock()
+
+	// DPrintf("%d Start waiting for %s, %s, %s", kv.me, op.Key, op.Value, op.Type)
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Type:      args.Op,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+
+	idx, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+	ch, ok := kv.channels[idx]
+	if !ok {
+		ch = make(chan Result, 1)
+		kv.channels[idx] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case <-time.After(time.Millisecond * 6000):
+		reply.Err = ErrWrongLeader
+	case res := <-ch:
+		if res.ClientId != op.ClientId || res.RequestId != op.RequestId {
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		reply.Err = OK
+		kv.mu.Lock()
+		delete(kv.channels, idx)
+		kv.mu.Unlock()
+	}
+	return
+	// DPrintf("Start waiting for client %d, %s, %s, %s", op.ClientId, op.Key, op.Value, op.Type)
 }
 
 //
@@ -96,6 +208,94 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.store = make(map[string]string)
+	kv.channels = make(map[int]chan Result)
+	kv.lastRequest = make(map[int64]int)
+	time.Sleep(300 * time.Millisecond)
+
+	// start the background thread to check if the current kv is still leader
+	// go func() {
+	// 	for {
+	// 		time.Sleep(50 * time.Millisecond)
+	// 		kv.mu.Lock()
+	// 		_, isLeader := kv.rf.GetState()
+	// 		if !isLeader {
+	// 			res := Result{
+	// 				Err: ErrWrongLeader,
+	// 			}
+	// 			for clientId, ch := range kv.channels {
+	// 				DPrintf("server %d loss leadership, sending signal to client %d", kv.me, clientId)
+	// 				ch <- res
+	// 			}
+	// 			kv.cleanChannels()
+	// 		}
+	// 		kv.mu.Unlock()
+	// 	}
+	// }()
+
+	// start the background thread to listent to the applyCh
+	// to get the committed op and mutate the kv store
+	go func() {
+		for msg := range kv.applyCh {
+			op := msg.Command.(Op)
+			idx := msg.CommandIndex
+			res := Result{
+				Err:       "",
+				Value:     "",
+				CmdIdx:    msg.CommandIndex,
+				ClientId:  op.ClientId,
+				RequestId: op.RequestId,
+			}
+			// start to handle the committed op
+
+			// handle the duplicated request, by checking the request id
+			lastId := kv.lastRequest[op.ClientId]
+			if op.RequestId > lastId {
+				kv.lastRequest[op.ClientId] = op.RequestId
+				if op.Type == "Get" {
+					val, ok := kv.store[op.Key]
+					if ok {
+						res.Value = val
+						res.Err = OK
+					} else {
+						res.Err = ErrNoKey
+					}
+				} else if op.Type == "Put" {
+					kv.store[op.Key] = op.Value
+					res.Err = OK
+				} else {
+					val, ok := kv.store[op.Key]
+					if ok {
+						kv.store[op.Key] = val + op.Value
+					} else {
+						kv.store[op.Key] = op.Value
+					}
+					res.Err = OK
+				}
+			} else {
+				res.Err = OK
+				if op.Type == "Get" {
+					val, ok := kv.store[op.Key]
+					if ok {
+						res.Value = val
+					} else {
+						res.Err = ErrNoKey
+					}
+				}
+			}
+
+			kv.mu.Lock()
+			ch, ok := kv.channels[idx]
+			if !ok {
+				ch = make(chan Result, 1)
+				kv.channels[idx] = ch
+			}
+			kv.mu.Unlock()
+			DPrintf("Finish processing one result %s, %s, %s, client %d, request %d, server %d", op.Type, op.Key, op.Value, op.ClientId, op.RequestId, kv.me)
+
+			ch <- res
+		}
+	}()
 
 	return kv
 }
