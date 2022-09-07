@@ -213,26 +213,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastRequest = make(map[int64]int)
 	time.Sleep(300 * time.Millisecond)
 
-	// start the background thread to check if the current kv is still leader
-	// go func() {
-	// 	for {
-	// 		time.Sleep(50 * time.Millisecond)
-	// 		kv.mu.Lock()
-	// 		_, isLeader := kv.rf.GetState()
-	// 		if !isLeader {
-	// 			res := Result{
-	// 				Err: ErrWrongLeader,
-	// 			}
-	// 			for clientId, ch := range kv.channels {
-	// 				DPrintf("server %d loss leadership, sending signal to client %d", kv.me, clientId)
-	// 				ch <- res
-	// 			}
-	// 			kv.cleanChannels()
-	// 		}
-	// 		kv.mu.Unlock()
-	// 	}
-	// }()
-
 	// start the background thread to listent to the applyCh
 	// to get the committed op and mutate the kv store
 	go func() {

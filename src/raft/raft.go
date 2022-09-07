@@ -82,11 +82,8 @@ type Raft struct {
 	votedFor    int
 	logEntries  []LogEntry
 
-	state           string        // variable to check the current state of the server
-	electionTimeout time.Duration // reset upon each heartbeat
-	electionTime    time.Time     // timer for election timeout
-	heartbeatTime   time.Time     // timer for heartbeat timeout
-	voteCount       int           // number of vote collected
+	state     string // variable to check the current state of the server
+	voteCount int    // number of vote collected
 
 	commitIndex int
 	lastApplied int
@@ -196,12 +193,6 @@ func (rf *Raft) convertToFollower(term int) {
 	rf.votedFor = -1
 	rf.persist()
 	rf.sendSignal(rf.backToFollower, true)
-}
-
-// Reset election timer
-func (rf *Raft) resetElectionTimer() {
-	rf.electionTime = time.Now()
-	rf.electionTimeout = time.Duration(rand.Intn(ElectionTimeOutRange)+ElectionTimeOutBase) * time.Millisecond
 }
 
 func (rf *Raft) getElectionTimeout() time.Duration {
@@ -365,22 +356,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = rf.getLastEntryIndex() + 1
 		return
 	}
-
-	// DPrintf("Server %d, args perv log %d, args perv term %d, my log %v", rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.logEntries)
-	// pervCheck := rf.checkPerv(args.PrevLogIndex, args.PrevLogTerm)
-
-	// if pervCheck == false {
-	// 	reply.Term = rf.currentTerm
-	// 	reply.Success = false
-	// 	rf.updateXInfo(args.PrevLogIndex, args.PrevLogTerm, reply)
-	// 	DPrintf("XTerm %d, XIndex %d, XLen %d", reply.XTerm, reply.XIndex, reply.XLen)
-	// 	return
-	// }
-
-	// if len(args.Entries) == 0 {
-	// 	rf.checkCommit(args.LeaderCommit)
-	// 	return
-	// }
 
 	i, j := args.PrevLogIndex+1, 0
 	for ; i < len(rf.logEntries) && j < len(args.Entries); i, j = i+1, j+1 {
@@ -649,85 +624,6 @@ func (rf *Raft) updateNextIdx(reply *AppendEntriesReply) int {
 	return val
 }
 
-// replicaLog is the function used by leader to send log to replica
-func (rf *Raft) replicaLog(isHeartbeat bool) {
-	term := rf.currentTerm
-	if isHeartbeat == true {
-		rf.heartbeatTime = time.Now() // rest the heartbeatTime
-	}
-	rf.mu.Unlock()
-
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-
-		go func(server int, term int, isHeartbeat bool) {
-			rf.mu.Lock()
-			if rf.state != Leader || rf.currentTerm != term {
-				rf.mu.Unlock()
-				return
-			}
-
-			nextIdx := rf.nextIndex[server]
-			lastIdx := len(rf.logEntries) - 1
-			if lastIdx < nextIdx && isHeartbeat == false { // in this case, we have nothing to update
-				rf.mu.Unlock()
-				return
-			}
-
-			perLogIdx := nextIdx - 1
-			perLogTerm := rf.logEntries[perLogIdx].Term
-
-			entries := rf.logEntries[nextIdx:]
-			if isHeartbeat {
-				entries = make([]LogEntry, 0)
-			}
-
-			args := &AppendEntriesArgs{
-				Term:         term,
-				LeaderId:     rf.me,
-				PrevLogIndex: perLogIdx,
-				PrevLogTerm:  perLogTerm,
-				Entries:      entries,
-				LeaderCommit: rf.commitIndex,
-			}
-
-			reply := &AppendEntriesReply{}
-			rf.mu.Unlock()
-
-			ok := rf.sendAppendEntries(server, args, reply)
-
-			if ok {
-				rf.mu.Lock()
-				DPrintf("%d append entries get reply from %d, %t on term %d, is heartbeat? %t", rf.me, server, reply.Success, reply.Term, isHeartbeat)
-				if reply.Term != rf.currentTerm || rf.state != Leader {
-					rf.mu.Unlock()
-					return
-				}
-
-				if reply.Term > rf.currentTerm { // at this time we need to step down
-					rf.convertToFollower(reply.Term)
-					rf.mu.Unlock()
-					return
-				}
-
-				if reply.Success {
-					rf.matchIndex[server] = lastIdx
-					rf.nextIndex[server] = lastIdx + 1
-				} else {
-					rf.nextIndex[server] = rf.updateNextIdx(reply)
-					rf.matchIndex[server] = rf.nextIndex[server] - 1
-				}
-
-				rf.updateCommit()
-				rf.mu.Unlock()
-				return
-			}
-		}(peer, term, isHeartbeat)
-	}
-}
-
 func (rf *Raft) updateCommit() {
 	DPrintf("leader %d, current match index %v, current commit index %d, current log lenght %d", rf.me, rf.matchIndex, rf.commitIndex, len(rf.logEntries))
 
@@ -778,7 +674,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	rf.logEntries = append(rf.logEntries, LogEntry{Command: command, Term: term})
 	rf.persist()
-	// rf.replicaLog(false)
 
 	return index, term, isLeader
 }
@@ -881,8 +776,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.logEntries = make([]LogEntry, 1)
 	rf.state = Follower
-	rf.electionTime = time.Now()
-	rf.electionTimeout = time.Duration(rand.Intn(300)+500) * time.Millisecond
 	rf.votedFor = -1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
