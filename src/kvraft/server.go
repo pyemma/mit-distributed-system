@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -50,9 +51,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store       map[string]string   // store of the key/value
-	channels    map[int]chan Result // store of channels
-	lastRequest map[int64]int       // store of last request id
+	store          map[string]string   // store of the key/value
+	channels       map[int]chan Result // store of channels
+	lastRequest    map[int64]int       // store of last request id
+	lastCommandIdx int
 }
 
 func (kv *KVServer) cleanChannels() {
@@ -141,7 +143,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	select {
-	case <-time.After(time.Millisecond * 6000):
+	case <-time.After(time.Millisecond * 600):
 		reply.Err = ErrWrongLeader
 	case res := <-ch:
 		if res.ClientId != op.ClientId || res.RequestId != op.RequestId {
@@ -177,6 +179,27 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) snapshotting() {
+
+	for {
+		time.Sleep(100 * time.Millisecond)
+		if kv.rf.GetRaftSize() >= kv.maxraftstate {
+			kv.mu.Lock()
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.store)
+			e.Encode(kv.lastRequest)
+			e.Encode(kv.lastCommandIdx)
+			data := w.Bytes()
+			lastCommandIdx := kv.lastCommandIdx
+			kv.mu.Unlock()
+
+			DPrintf("server %d start to compact log %d", kv.me, lastCommandIdx)
+			kv.rf.StartSnapshot(data, lastCommandIdx)
+		}
+	}
 }
 
 //
@@ -217,65 +240,92 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// to get the committed op and mutate the kv store
 	go func() {
 		for msg := range kv.applyCh {
-			op := msg.Command.(Op)
-			idx := msg.CommandIndex
-			res := Result{
-				Err:       "",
-				Value:     "",
-				CmdIdx:    msg.CommandIndex,
-				ClientId:  op.ClientId,
-				RequestId: op.RequestId,
-			}
-			// start to handle the committed op
+			if msg.CommandValid {
 
-			// handle the duplicated request, by checking the request id
-			lastId := kv.lastRequest[op.ClientId]
-			if op.RequestId > lastId {
-				kv.lastRequest[op.ClientId] = op.RequestId
-				if op.Type == "Get" {
-					val, ok := kv.store[op.Key]
-					if ok {
-						res.Value = val
+				op := msg.Command.(Op)
+				idx := msg.CommandIndex
+				res := Result{
+					Err:       "",
+					Value:     "",
+					CmdIdx:    msg.CommandIndex,
+					ClientId:  op.ClientId,
+					RequestId: op.RequestId,
+				}
+				// start to handle the committed op
+				kv.mu.Lock()
+				// handle the duplicated request, by checking the request id
+				lastId := kv.lastRequest[op.ClientId]
+				kv.lastCommandIdx = idx
+				if op.RequestId > lastId {
+					kv.lastRequest[op.ClientId] = op.RequestId
+					if op.Type == "Get" {
+						val, ok := kv.store[op.Key]
+						if ok {
+							res.Value = val
+							res.Err = OK
+						} else {
+							res.Err = ErrNoKey
+						}
+					} else if op.Type == "Put" {
+						kv.store[op.Key] = op.Value
 						res.Err = OK
 					} else {
-						res.Err = ErrNoKey
+						val, ok := kv.store[op.Key]
+						if ok {
+							kv.store[op.Key] = val + op.Value
+						} else {
+							kv.store[op.Key] = op.Value
+						}
+						res.Err = OK
+						val, ok = kv.store[op.Key]
 					}
-				} else if op.Type == "Put" {
-					kv.store[op.Key] = op.Value
-					res.Err = OK
 				} else {
-					val, ok := kv.store[op.Key]
-					if ok {
-						kv.store[op.Key] = val + op.Value
-					} else {
-						kv.store[op.Key] = op.Value
-					}
 					res.Err = OK
-				}
-			} else {
-				res.Err = OK
-				if op.Type == "Get" {
-					val, ok := kv.store[op.Key]
-					if ok {
-						res.Value = val
-					} else {
-						res.Err = ErrNoKey
+					if op.Type == "Get" {
+						val, ok := kv.store[op.Key]
+						if ok {
+							res.Value = val
+						} else {
+							res.Err = ErrNoKey
+						}
 					}
 				}
-			}
 
-			kv.mu.Lock()
-			ch, ok := kv.channels[idx]
-			if !ok {
-				ch = make(chan Result, 1)
-				kv.channels[idx] = ch
-			}
-			kv.mu.Unlock()
-			DPrintf("Finish processing one result %s, %s, %s, client %d, request %d, server %d", op.Type, op.Key, op.Value, op.ClientId, op.RequestId, kv.me)
+				ch, ok := kv.channels[idx]
+				if !ok {
+					ch = make(chan Result, 1)
+					kv.channels[idx] = ch
+				}
+				kv.mu.Unlock()
+				// DPrintf("Finish processing one result %s, %s, %s, client %d, request %d, server %d", op.Type, op.Key, op.Value, op.ClientId, op.RequestId, kv.me)
 
-			ch <- res
+				ch <- res
+			} else {
+				data := msg.Command.([]byte)
+				r := bytes.NewBuffer(data)
+				d := labgob.NewDecoder(r)
+				var store map[string]string
+				var lastRequest map[int64]int
+				var lastCommandIdx int
+				if d.Decode(&store) != nil ||
+					d.Decode(&lastRequest) != nil ||
+					d.Decode(&lastCommandIdx) != nil {
+					DPrintf("Fail to read kv store value")
+				} else {
+					kv.mu.Lock()
+					kv.store = store
+					kv.lastRequest = lastRequest
+					kv.lastCommandIdx = lastCommandIdx
+					DPrintf("server %d read snapshot, last command idx %d, installed value %v", kv.me, lastCommandIdx, kv.store)
+					kv.mu.Unlock()
+				}
+			}
 		}
 	}()
+
+	if kv.maxraftstate != -1 {
+		go kv.snapshotting()
+	}
 
 	return kv
 }
